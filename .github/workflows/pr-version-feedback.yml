@@ -1,0 +1,154 @@
+name: PR version feedback
+
+on:
+    pull_request:
+        branches:
+            - master
+        types:
+            - opened
+            - edited
+            - synchronize
+            - reopened
+
+permissions:
+    contents: read
+    pull-requests: write
+
+jobs:
+    version-feedback:
+        name: Version feedback
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout PR branch
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Validate version and comment
+              shell: bash
+              env:
+                  PR_TITLE: ${{ github.event.pull_request.title }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+                  GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+              run: |
+                  set -euo pipefail
+
+                  FILE="public/assets/images/version.json"
+                  TITLE_REGEX='^.+ V[0-9]+(\.[0-9]+){3}$'
+
+                  STATUS_TITLE="❌"
+                  STATUS_FILE="❌"
+                  STATUS_MATCH="❌"
+                  STATUS_GREATER="❌"
+
+                  READY_TO_MERGE="false"
+                  MESSAGES=()
+
+                  PR_VERSION=""
+                  FILE_VERSION=""
+                  LATEST_VERSION=""
+
+                  if [[ "$PR_TITLE" =~ $TITLE_REGEX ]]; then
+                    STATUS_TITLE="✅"
+                    PR_VERSION="$(echo "$PR_TITLE" | grep -oE 'V[0-9]+(\.[0-9]+){3}$' | sed 's/^V//')"
+                  else
+                    MESSAGES+=("El título del PR debe cumplir el formato: \`Koi Cobalt V20.2.2.18\`.")
+                  fi
+
+                  if [[ -f "$FILE" ]]; then
+                    STATUS_FILE="✅"
+                    FILE_VERSION="$(jq -r '.version // empty' "$FILE")"
+                  else
+                    MESSAGES+=("No existe el archivo \`$FILE\`.")
+                  fi
+
+                  if [[ -n "$PR_VERSION" && -n "$FILE_VERSION" && "$PR_VERSION" == "$FILE_VERSION" ]]; then
+                    STATUS_MATCH="✅"
+                  elif [[ -n "$PR_VERSION" ]]; then
+                    MESSAGES+=("La versión del archivo no coincide con la versión del título del PR.")
+                  fi
+
+                  git fetch --tags --force
+
+                  LATEST_TAG="$(git tag --sort=-version:refname | grep -E '^v?[0-9]+(\.[0-9]+){3}$' | head -n1 || true)"
+                  LATEST_VERSION="${LATEST_TAG#v}"
+
+                  if [[ -z "$LATEST_VERSION" ]]; then
+                    STATUS_GREATER="⚠️"
+                    MESSAGES+=("No se encontró un tag previo con formato \`v20.2.2.18\` o \`20.2.2.18\`.")
+                  elif [[ -n "$PR_VERSION" ]]; then
+                    HIGHER_VERSION="$(printf '%s\n%s\n' "$LATEST_VERSION" "$PR_VERSION" | sort -V | tail -n1)"
+
+                    if [[ "$HIGHER_VERSION" == "$PR_VERSION" && "$PR_VERSION" != "$LATEST_VERSION" ]]; then
+                      STATUS_GREATER="✅"
+                    else
+                      MESSAGES+=("La versión del PR debe ser mayor que la versión actual: \`$LATEST_VERSION\`.")
+                    fi
+                  fi
+
+                  if [[ "$STATUS_TITLE" == "✅" && "$STATUS_FILE" == "✅" && "$STATUS_MATCH" == "✅" && "$STATUS_GREATER" == "✅" ]]; then
+                    READY_TO_MERGE="true"
+                  fi
+
+                  COMMAND_VERSION="${PR_VERSION:-20.2.2.18}"
+
+                  cat > pr-comment.md <<EOF
+                  <!-- pr-version-feedback -->
+
+                  ## PR version feedback
+
+                  EOF
+
+                  if [[ "$READY_TO_MERGE" == "true" ]]; then
+                    cat >> pr-comment.md <<EOF
+                  ✅ **Available to merge**
+
+                  EOF
+                  else
+                    cat >> pr-comment.md <<EOF
+                  ⚠️ **Not ready to merge**
+
+                  EOF
+                  fi
+
+                  cat >> pr-comment.md <<EOF
+                  | Check | Status |
+                  |---|---|
+                  | Título con formato válido | $STATUS_TITLE |
+                  | Archivo \`$FILE\` existe | $STATUS_FILE |
+                  | Versión del título y archivo son iguales | $STATUS_MATCH |
+                  | Versión mayor que la actual | $STATUS_GREATER |
+
+                  **PR title:** \`$PR_TITLE\`  
+                  **PR version:** \`${PR_VERSION:-N/A}\`  
+                  **File version:** \`${FILE_VERSION:-N/A}\`  
+                  **Current release version:** \`${LATEST_VERSION:-N/A}\`
+
+                  EOF
+
+                  if [[ "$READY_TO_MERGE" != "true" ]]; then
+                    {
+                      echo ""
+                      echo "### Qué falta"
+                      for msg in "${MESSAGES[@]}"; do
+                        echo "- $msg"
+                      done
+
+                      echo ""
+                      echo "### Comando sugerido"
+                      echo ""
+                      echo '```bash'
+                      echo "VERSION=\"$COMMAND_VERSION\"; FILE=\"$FILE\"; mkdir -p \"\$(dirname \"\$FILE\")\"; jq -n --arg version \"\$VERSION\" '{version: \$version}' > \"\$FILE\""
+                      echo '```'
+                    } >> pr-comment.md
+                  fi
+
+                  gh pr comment "$PR_NUMBER" \
+                    --repo "$REPO" \
+                    --body-file pr-comment.md \
+                    --edit-last \
+                    --create-if-none
+
+                  echo "Version feedback completed."
